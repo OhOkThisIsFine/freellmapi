@@ -281,13 +281,17 @@ describe('Anthropic passthrough lane wired into POST /v1/messages', () => {
     expect(typeof res.body.input_tokens).toBe('number');
   });
 
-  it('leaves the unified key working while the lane is on', async () => {
+  it('keeps a unified-key caller on the free pool instead of forwarding it', async () => {
+    // The unified key means "use the free pool" and nothing else. Forwarding it
+    // would 401 upstream — silently breaking every existing all-free client the
+    // moment the lane is enabled — and would hand our own gateway credential to
+    // a third party. mockGroq throws if the passthrough is taken.
     enableLane();
-    const calls = mockUpstream(jsonReply({ id: 'msg_up', type: 'message', role: 'assistant', content: [] }));
+    mockGroq(groqCompletion('still pooled'));
 
     const res = await postRaw(app, '/v1/messages', JSON.stringify(body()), anthropicHeaders(getUnifiedApiKey()));
 
     expect(res.status).toBe(200);
-    expect(calls).toHaveLength(1);
+    expect(res.body.content[0].text).toBe('still pooled');
   });
 });

@@ -474,6 +474,25 @@ function rescuedToToolCalls(
 }
 
 /**
+ * Whether the caller authenticated with FreeLLMAPI's OWN unified key.
+ *
+ * Such a caller is asking for the free pool by definition — that is the only
+ * thing the key means — so the lane must never pass their request through. Two
+ * reasons, and the second is the important one:
+ *
+ *   * Upstream would reject it anyway; a `freellmapi-…` token is not an
+ *     Anthropic credential. Without this check, enabling the lane silently
+ *     breaks every existing all-free client (claude.ps1 among them), because
+ *     only their SUBAGENT turns would still work.
+ *   * Forwarding it would hand our own gateway credential to a third party that
+ *     has no business holding it.
+ */
+function presentsUnifiedKey(req: Request): boolean {
+  const token = extractApiToken(req);
+  return !!token && timingSafeStringEqual(token, getUnifiedApiKey());
+}
+
+/**
  * The bytes to forward upstream.
  *
  * The raw buffer is the correct answer and is present for every ordinary JSON
@@ -539,7 +558,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const passthrough = passthroughConfig();
   if (passthrough.mode !== 'off') {
     const subagent = isSubagentRequest(req.body, req.headers);
-    if (shouldPassthrough(passthrough.mode, subagent)) {
+    if (!presentsUnifiedKey(req) && shouldPassthrough(passthrough.mode, subagent)) {
       await passthroughMessages(req, res, passthrough);
       return;
     }
