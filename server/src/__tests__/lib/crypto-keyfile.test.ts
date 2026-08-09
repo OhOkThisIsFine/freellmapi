@@ -4,6 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { initEncryptionKey, encrypt, decrypt } from '../../lib/crypto.js';
+import { aclEntries } from '../helpers/acl.js';
 
 // FIX 2: the dev-fallback key is persisted to a file next to the DB, not into
 // the `settings` table it protects. These tests use REAL file-backed DBs
@@ -59,8 +60,13 @@ describe('initEncryptionKey — key file (dev fallback)', () => {
     const enc = encrypt('hello');
     expect(decrypt(enc.encrypted, enc.iv, enc.authTag)).toBe('hello');
 
+    // The master key must be owner-only. Each platform asserts what it can
+    // actually enforce: POSIX modes on POSIX, the NTFS ACL on Windows, where
+    // chmod cannot express this at all.
     if (process.platform !== 'win32') {
       expect(fs.statSync(keyFile).mode & 0o777).toBe(0o600);
+    } else {
+      expect(aclEntries(keyFile).filter(e => e.includes('(I)'))).toEqual([]);
     }
   });
 

@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'url';
 import { runMigrationsSync } from './migrate/runner.js';
 import { initEncryptionKey, isEncryptionKeyInitialized } from '../lib/crypto.js';
+import { restrictAllToOwner } from '../lib/file-permissions.js';
 import { nodeSqliteFactory } from './node-sqlite.js';
 import type { Db, DbFactory } from './types.js';
 
@@ -83,16 +84,24 @@ export function connectDb(
 
 /** Restrict the DB and its WAL sidecars to the owner. The file holds encrypted
  *  provider keys plus the dashboard password hash, so it must not be readable by
- *  other local users. Best-effort: filesystems without POSIX modes (Windows,
- *  some mounts) throw, and that must not stop startup. */
+ *  other local users. Best-effort: a filesystem that cannot express the
+ *  restriction must not stop startup — but it now says so instead of failing
+ *  silently, because a hardening step nobody can see failing is one nobody
+ *  notices is absent.
+ *
+ *  Known gap, pre-existing and platform-independent: on a clean start the
+ *  `-wal`/`-shm` sidecars do not exist yet (SQLite creates them on the first
+ *  write and removes them on the last close), so this pass only ever restricts
+ *  the main file. Covering them needs the containing directory to carry the
+ *  restriction so new children inherit it, which cannot be done blindly here —
+ *  FREEAPI_DB_PATH may point anywhere, including a shared temp directory. */
 function restrictDbFilePermissions(resolvedPath: string): void {
-  for (const suffix of ['', '-wal', '-shm']) {
-    const target = `${resolvedPath}${suffix}`;
-    try {
-      if (fs.existsSync(target)) fs.chmodSync(target, 0o600);
-    } catch {
-      // Non-fatal: permissions are a hardening measure, not a correctness one.
-    }
+  const failed = restrictAllToOwner(['', '-wal', '-shm'].map(suffix => `${resolvedPath}${suffix}`));
+  if (failed.length > 0) {
+    console.warn(
+      `[db] could not restrict database file permissions (${failed.length} of 3 targets); ` +
+      'the database may be readable by other local accounts',
+    );
   }
 }
 
