@@ -36,6 +36,7 @@ import { createProxyRateLimiter, createAdminRateLimiter } from './middleware/rat
 const EXPORT_RATE_LIMIT_RPM = 10;
 import { errorHandler } from './middleware/errorHandler.js';
 import { clientContextMiddleware } from './lib/client-context.js';
+import { captureRawBody } from './lib/raw-body.js';
 import type { Config } from './lib/config.js';
 import { loadConfig } from './lib/config.js';
 
@@ -174,7 +175,10 @@ export function createApp(config?: Config) {
   // 10mb: code agents (OpenCode, AionUI, Qwen Code) ship very large system
   // prompts + tool schemas + repo context; 1mb cut their sessions off
   // mid-conversation with an opaque 413. (#200)
-  app.use(express.json({ limit: '10mb' }));
+  // `verify` keeps the raw bytes on the request (see lib/raw-body.ts) so the
+  // Anthropic passthrough lane can forward a body byte-exactly instead of
+  // re-serializing the parsed object. It only observes; it never rejects.
+  app.use(express.json({ limit: '10mb', verify: captureRawBody }));
 
   // Caller identity (IP + User-Agent) for request analytics, carried in
   // AsyncLocalStorage so logRequest() can read it from any depth.
