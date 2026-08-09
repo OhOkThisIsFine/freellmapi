@@ -25,6 +25,15 @@ import { resolveAnthropicModel } from '../services/anthropic-map.js';
 import type { ReasoningEffort } from '../lib/sampling-params.js';
 import { buildModelListing } from '../services/model-listing.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
+import {
+  readPassthroughConfig,
+  shouldPassthrough,
+  forwardToAnthropic,
+  relayResponse,
+  type PassthroughConfig,
+} from '../lib/anthropic-passthrough.js';
+import { isSubagentRequest, subagentSignal } from '../lib/subagent-detect.js';
+import { rawBody } from '../lib/raw-body.js';
 
 // Anthropic-compatible Messages API (`POST /v1/messages`). This is a thin
 // translation layer over the SAME router/fallback/analytics machinery the
@@ -187,8 +196,39 @@ function newMessageId(): string {
   return `msg_${crypto.randomBytes(12).toString('hex')}`;
 }
 
+// ── Passthrough lane ────────────────────────────────────────────────────────
+// Read once, not per request: readPassthroughConfig logs when it refuses to
+// enable itself, and that message is a boot-time fact, not something to repeat
+// on every call. The environment cannot change under a running process.
+let passthroughConfigCache: PassthroughConfig | null = null;
+
+function passthroughConfig(): PassthroughConfig {
+  if (!passthroughConfigCache) passthroughConfigCache = readPassthroughConfig();
+  return passthroughConfigCache;
+}
+
+/** Test-only: drop the memo so a changed environment is re-read. */
+export function resetPassthroughConfigCache(): void {
+  passthroughConfigCache = null;
+}
+
 // ── Auth (shared with the OpenAI route) ─────────────────────────────────────
 function authenticate(req: Request, res: Response): boolean {
+  // ⚠ The passthrough lane cannot demand the unified key. In that topology the
+  // client is a Claude Code session authenticating with its ANTHROPIC
+  // credential — that is the whole point, it is what gets forwarded upstream —
+  // and the free-pool half of the same session carries that same credential,
+  // which we equally cannot check. So enabling the lane delegates
+  // authentication: upstream for the passthrough half, implicit trust for the
+  // free-pool half.
+  //
+  // What contains that is readPassthroughConfig's loopback guard: the mode
+  // cannot be on unless HOST is loopback, so "unauthenticated" here means
+  // "already on this machine". Off-loopback the mode is forced back to `off`
+  // and this branch is unreachable, which is why the guard is the load-bearing
+  // control and not this check.
+  if (passthroughConfig().mode !== 'off') return true;
+
   const token = extractApiToken(req);
   const unifiedKey = getUnifiedApiKey();
   if (!token || !timingSafeStringEqual(token, unifiedKey)) {
@@ -419,9 +459,78 @@ function rescuedToToolCalls(
   }));
 }
 
+/**
+ * The bytes to forward upstream.
+ *
+ * The raw buffer is the correct answer and is present for every ordinary JSON
+ * request. The fallback covers the case where `express.json()` declined to
+ * parse (so its verify hook never ran) but a body still exists: re-serializing
+ * keeps the lane working, at the cost of no longer being byte-exact.
+ */
+function forwardBody(req: Request): Buffer | string | undefined {
+  const raw = rawBody(req);
+  if (raw) return raw;
+  if (req.body === undefined || req.body === null) return undefined;
+  return JSON.stringify(req.body);
+}
+
+/**
+ * Forward this request to Anthropic under the caller's own credential and relay
+ * the response back verbatim.
+ *
+ * A failure here is OUR hop failing, not Anthropic rejecting the request — an
+ * upstream 4xx/5xx arrives as a normal response and is relayed through
+ * untouched. So the only thing this catch reports is transport failure, as a
+ * 502, and it stays silent for a client that hung up mid-stream.
+ */
+async function passthroughMessages(req: Request, res: Response, cfg: PassthroughConfig): Promise<void> {
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) clientAbort.abort(newClientAbortError());
+  });
+
+  try {
+    const upstream = await forwardToAnthropic({
+      baseUrl: cfg.baseUrl,
+      path: '/v1/messages',
+      method: 'POST',
+      inboundHeaders: req.headers,
+      body: forwardBody(req),
+      signal: clientAbort.signal,
+    });
+    await relayResponse(res, upstream);
+  } catch (err) {
+    if (isClientAbortError(err) || clientAbort.signal.aborted) {
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    console.error(`[passthrough] forward to ${cfg.baseUrl} failed: ${(err as Error)?.message ?? err}`);
+    // Headers already sent means the stream had started; there is no way to
+    // turn that into an error envelope, so cut it rather than append garbage.
+    if (res.headersSent) { res.end(); return; }
+    sendError(res, 502, 'api_error', 'Upstream request failed');
+  }
+}
+
 anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const start = Date.now();
   if (!authenticate(req, res)) return;
+
+  // The fork. In `subagent-offload` the SUBAGENT drops to the free pool and
+  // everything else passes through untouched, so a detection miss costs paid
+  // quota rather than silently downgrading the user's own conversation. Runs
+  // before schema validation: a passthrough request is Anthropic's to validate,
+  // not ours, and our permissive-but-not-identical schema must not 400 a
+  // request we are only relaying.
+  const passthrough = passthroughConfig();
+  if (passthrough.mode !== 'off') {
+    const subagent = isSubagentRequest(req.body, req.headers);
+    if (shouldPassthrough(passthrough.mode, subagent)) {
+      await passthroughMessages(req, res, passthrough);
+      return;
+    }
+    console.log(`[passthrough] subagent → free pool (signal: ${subagentSignal(req.body, req.headers)})`);
+  }
 
   const parsed = messagesSchema.safeParse(req.body);
   if (!parsed.success) {
