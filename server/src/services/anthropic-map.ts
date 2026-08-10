@@ -14,30 +14,64 @@ import { getDb, getSetting, setSetting } from '../db/index.js';
 
 const SETTING_KEY = 'anthropic_model_map';
 
-export const CLAUDE_FAMILIES = ['default', 'opus', 'sonnet', 'haiku'] as const;
+export const CLAUDE_FAMILIES = ['default', 'opus', 'sonnet', 'haiku', 'fable'] as const;
 export type ClaudeFamily = (typeof CLAUDE_FAMILIES)[number];
-// Each value is either the sentinel 'auto' or a catalog model_id.
-export type AnthropicModelMap = Record<ClaudeFamily, string>;
+/**
+ * A family maps to one of three things:
+ *   'auto'                    — let the router pick from the whole chain
+ *   'some-model-id'           — pin that model first, whole chain behind it
+ *   ['first', 'second', ...]  — a POOL: only these, in this order (local
+ *                               reproduction of llm-relay's `routing.tiers`)
+ *
+ * The pool form is the one that carries a *boundary*. A single pin only
+ * expresses a preference — `preferredModelDbId` moves a model to the front and
+ * the rest of the chain still serves behind it. A pool restricts the candidate
+ * set, which is what makes "keep the background/small tier small" mean
+ * anything.
+ */
+export type FamilyTarget = string | string[];
+export type AnthropicModelMap = Record<ClaudeFamily, FamilyTarget>;
 
-const DEFAULT_MAP: AnthropicModelMap = { default: 'auto', opus: 'auto', sonnet: 'auto', haiku: 'auto' };
+const DEFAULT_MAP: AnthropicModelMap = {
+  default: 'auto', opus: 'auto', sonnet: 'auto', haiku: 'auto', fable: 'auto',
+};
+
+const familyTargetSchema = z.union([
+  z.string().min(1),
+  z.array(z.string().min(1)).min(1),
+]);
 
 export const anthropicModelMapSchema = z.object({
-  default: z.string().min(1).optional(),
-  opus: z.string().min(1).optional(),
-  sonnet: z.string().min(1).optional(),
-  haiku: z.string().min(1).optional(),
+  default: familyTargetSchema.optional(),
+  opus: familyTargetSchema.optional(),
+  sonnet: familyTargetSchema.optional(),
+  haiku: familyTargetSchema.optional(),
+  fable: familyTargetSchema.optional(),
 }).strict();
+
+/** Normalize one stored value, dropping anything that isn't a non-empty string
+ *  or a non-empty array of them. A malformed entry degrades to 'auto' rather
+ *  than throwing on the proxy hot path. */
+function readTarget(value: unknown): FamilyTarget {
+  if (typeof value === 'string' && value) return value;
+  if (Array.isArray(value)) {
+    const ids = value.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    if (ids.length > 0) return ids;
+  }
+  return 'auto';
+}
 
 export function getClaudeModelMap(): AnthropicModelMap {
   const raw = getSetting(SETTING_KEY);
   if (!raw) return { ...DEFAULT_MAP };
   try {
-    const p = JSON.parse(raw) as Partial<AnthropicModelMap>;
+    const p = JSON.parse(raw) as Partial<Record<ClaudeFamily, unknown>>;
     return {
-      default: typeof p.default === 'string' && p.default ? p.default : 'auto',
-      opus: typeof p.opus === 'string' && p.opus ? p.opus : 'auto',
-      sonnet: typeof p.sonnet === 'string' && p.sonnet ? p.sonnet : 'auto',
-      haiku: typeof p.haiku === 'string' && p.haiku ? p.haiku : 'auto',
+      default: readTarget(p.default),
+      opus: readTarget(p.opus),
+      sonnet: readTarget(p.sonnet),
+      haiku: readTarget(p.haiku),
+      fable: readTarget(p.fable),
     };
   } catch {
     return { ...DEFAULT_MAP };
@@ -52,6 +86,7 @@ export function setClaudeModelMap(input: unknown): AnthropicModelMap {
     opus: patch.opus ?? current.opus,
     sonnet: patch.sonnet ?? current.sonnet,
     haiku: patch.haiku ?? current.haiku,
+    fable: patch.fable ?? current.fable,
   };
   setSetting(SETTING_KEY, JSON.stringify(next));
   return next;
@@ -68,6 +103,7 @@ export function classifyClaudeFamily(model?: string): ClaudeFamily | null {
   if (m.includes('opus')) return 'opus';
   if (m.includes('sonnet')) return 'sonnet';
   if (m.includes('haiku')) return 'haiku';
+  if (m.includes('fable')) return 'fable';
   // Any other claude-ish alias → the catch-all.
   if (m.startsWith('claude')) return 'default';
   return null;
@@ -78,6 +114,11 @@ export interface ResolvedAnthropicModel {
   preferredModelDbId?: number;
   // True when we resolved to a specific model (for analytics/pinned labels).
   pinned: boolean;
+  // An ordered, RESTRICTED candidate set when the family maps to a pool. The
+  // caller turns this into the routing chain, so nothing outside it can serve.
+  // Ids are already filtered to enabled models, in the operator's declared
+  // order.
+  poolDbIds?: number[];
 }
 
 // Resolve the model a `/v1/messages` request should route to, honoring the
@@ -94,6 +135,21 @@ export function resolveAnthropicModel(model?: string): ResolvedAnthropicModel {
   if (family) {
     const target = getClaudeModelMap()[family];
     if (!target || target === 'auto') return { pinned: false };
+
+    if (Array.isArray(target)) {
+      // A pool. Resolve members in declared order, dropping any that are
+      // disabled or gone. An empty result degrades to auto for the same reason
+      // a dead single pin does: refusing to serve because the operator's map
+      // went stale is worse than routing normally.
+      const ids: number[] = [];
+      for (const memberId of target) {
+        const id = lookupEnabled(memberId);
+        if (id != null && !ids.includes(id)) ids.push(id);
+      }
+      if (ids.length === 0) return { pinned: false };
+      return { poolDbIds: ids, preferredModelDbId: ids[0], pinned: true };
+    }
+
     const id = lookupEnabled(target);
     // A pinned-but-now-disabled/removed target degrades gracefully to auto.
     return id != null ? { preferredModelDbId: id, pinned: true } : { pinned: false };

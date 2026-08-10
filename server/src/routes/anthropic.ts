@@ -9,7 +9,7 @@ import type {
   ChatToolChoice,
   ChatContentBlock,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, resolveStickyPreference, routingReserveTokens, type RouteResult } from '../services/router.js';
+import { routeRequest, resolveStickyPreference, resolveModelGroupCandidates, routingReserveTokens, type RouteResult, type ChainRow } from '../services/router.js';
 import { getSetting, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -655,6 +655,24 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   let preferredModel = resolved.preferredModelDbId;
   if (preferredModel == null) preferredModel = resolveStickyPreference(getStickyModel(messages, sessionId));
 
+  // A family mapped to a POOL replaces the routing chain outright, so failover
+  // stays inside the pool instead of falling through to the whole catalog —
+  // the boundary a single pin cannot express. Ordered by the operator's
+  // declared list position under the `priority` strategy; a bandit strategy
+  // still scores the members on observed reliability/speed.
+  //
+  // Session stickiness is deliberately NOT applied on top: the sticky model
+  // may sit outside the pool, and honoring it would silently reopen the
+  // boundary. Members are few and same-tier, so flap is bounded anyway.
+  let familyPoolChain: ChainRow[] | undefined;
+  if (resolved.poolDbIds && resolved.poolDbIds.length > 0) {
+    const chain = resolveModelGroupCandidates(resolved.poolDbIds, undefined, true);
+    if (chain.length > 0) familyPoolChain = chain;
+    // A pool whose members all resolved but are unusable right now (no key,
+    // rate-limited) leaves familyPoolChain undefined and falls back to normal
+    // routing — same graceful degradation as a stale single pin.
+  }
+
   // Thin adapter over the shared fallback loop (lib/fallback-loop.ts): the
   // cooldown/skip/penalty/exhaustion machinery is shared, only the Anthropic
   // request/stream translation lives here. This converged three drifts on this
@@ -685,7 +703,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
     state,
     attemptLog,
     clientGone: () => clientGone,
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, undefined, false, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
+    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, familyPoolChain, false, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
     dispatch: async (route, attempt) => {
       if (stream) {
         try {
