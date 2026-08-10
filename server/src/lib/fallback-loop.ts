@@ -48,7 +48,7 @@ import { checkKeyHealth, markKeyHealthyFromRequest } from '../services/health.js
 import { noteModelRetirementSignal } from '../services/model-retirement.js';
 import { getSetting } from '../db/index.js';
 import { newBreaker, recordBreakerFailure } from './guardrails.js';
-import { getRequestTrace, newRequestTrace, runWithRequestTrace, type AttemptOutcome, type RequestTrace } from './attempt-trace.js';
+import { getRequestTrace, newRequestTrace, runWithRequestTrace, type AttemptOutcome, type AttemptTraceRecord, type RequestTrace } from './attempt-trace.js';
 import { logRequest, persistRequestAttempts } from './request-log.js';
 
 // Every surface caps failover hops at the same number.
@@ -361,6 +361,69 @@ export function classifyAttemptError(err: any): AttemptErrorClass {
 const TRAIL_MAX_SHOWN = 10;
 const TRAIL_HEADER_MAX_LENGTH = 1024;
 
+// ── Detailed failover trace header (opt-in) ──────────────────────────────────
+// X-Fallback-Trail already tells a caller WHICH hops burned and WHY, but not
+// how long they cost. That is the part an agent cannot reconstruct: a request
+// answered in 40s reads identically whether one provider stalled for 39s or
+// four failed fast. The per-hop timings and the redacted provider message are
+// already collected for the request_attempts table; this exposes them on the
+// response so the caller sees them without a dashboard round trip.
+//
+// Off by default. It widens what an already-loopback-ish surface reveals —
+// hop timings plus provider error text — so it is opt-in like the discovery
+// aliases, not something a default install starts emitting. Precedence matches
+// the failover budget above: settings-table value, then env var, then off.
+export const EXPOSE_FALLBACK_DETAIL_SETTING = 'expose_fallback_detail_header';
+
+// Ten hops of "platform/model keyN=class t=…+…ms msg=…" with a capped message
+// each. Kept well under the 8 KB total header budget that proxies commonly
+// enforce, since this rides alongside X-Fallback-Trail's own 1 KB.
+const DETAIL_HEADER_MAX_LENGTH = 2048;
+// summarizeAttemptError caps at 200; the header wants a tighter budget so ten
+// hops still fit. The full text remains in request_attempts either way.
+const DETAIL_SUMMARY_MAX_LENGTH = 120;
+
+export function isFallbackDetailHeaderEnabled(): boolean {
+  let stored: string | undefined;
+  try {
+    stored = getSetting(EXPOSE_FALLBACK_DETAIL_SETTING);
+  } catch {
+    stored = undefined; // DB not ready — never throw on the proxy hot path
+  }
+  for (const raw of [stored, process.env.FALLBACK_DETAIL_HEADER]) {
+    if (raw === undefined || raw.trim() === '') continue;
+    const value = raw.trim().toLowerCase();
+    return value === '1' || value === 'true';
+  }
+  return false;
+}
+
+/**
+ * One `platform/model keyN=outcome t=<start>+<duration>ms msg=<summary>` segment
+ * per hop, `; `-joined — the same leading shape as X-Fallback-Trail so the two
+ * headers line up when read together.
+ *
+ * The summary is the already-redacted `errorSummary`, never `err.message`. Its
+ * semicolons become commas because `; ` is the record separator; nothing else
+ * is escaped, which keeps the value readable, and `safeHeaderValue` handles any
+ * non-ASCII on the way out.
+ */
+export function formatAttemptDetail(records: AttemptTraceRecord[]): string {
+  const shown = records.slice(0, TRAIL_MAX_SHOWN).map(r => {
+    const parts = [
+      `${r.platform}/${r.modelId}`,
+      `key${r.keyOrdinal}=${r.outcome}`,
+      `t=${r.startOffsetMs}+${r.durationMs}ms`,
+    ];
+    if (r.errorSummary) {
+      parts.push(`msg=${r.errorSummary.slice(0, DETAIL_SUMMARY_MAX_LENGTH).replace(/;/g, ',')}`);
+    }
+    return parts.join(' ');
+  });
+  const extra = records.length - shown.length;
+  return shown.join('; ') + (extra > 0 ? `; +${extra} more` : '');
+}
+
 export function formatAttemptTrail(attempts: AttemptRecord[]): string {
   const shown = attempts
     .slice(0, TRAIL_MAX_SHOWN)
@@ -378,6 +441,17 @@ export function formatAttemptTrail(attempts: AttemptRecord[]): string {
  * exactly the case an operator wants to notice. Values go through
  * safeHeaderValue so a non-ASCII or control-laden model id can neither inject
  * header lines nor make Node reject the response outright (#619).
+ *
+ * When EXPOSE_FALLBACK_DETAIL_SETTING is on, X-Fallback-Detail joins them with
+ * per-hop timings and the redacted provider message. Every caller runs inside
+ * the request's AsyncLocalStorage scope, so the trace is readable here without
+ * threading it through all five surfaces.
+ *
+ * Note what the detail header can and cannot contain: at flush time the trace
+ * holds exactly the hops that already FAILED, each with final timings. The hop
+ * currently being served is recorded only after dispatch returns — after
+ * res.json(), or after the whole stream has finished — so its duration is not
+ * knowable while headers are still open, on either path.
  */
 export function setFallbackHeaders(
   res: { setHeader(name: string, value: string): void },
@@ -393,6 +467,13 @@ export function setFallbackHeaders(
     // Ten hops of "platform/model keyN=class" outgrow the default cap, so the
     // trail gets its own budget.
     res.setHeader('X-Fallback-Trail', safeHeaderValue(value, TRAIL_HEADER_MAX_LENGTH));
+  }
+
+  // Checked before the setting so the overwhelmingly common no-failover request
+  // never pays for a settings read.
+  const records = getRequestTrace()?.records;
+  if (records && records.length > 0 && isFallbackDetailHeaderEnabled()) {
+    res.setHeader('X-Fallback-Detail', safeHeaderValue(formatAttemptDetail(records), DETAIL_HEADER_MAX_LENGTH));
   }
 }
 

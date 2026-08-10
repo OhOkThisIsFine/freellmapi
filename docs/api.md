@@ -233,7 +233,24 @@ Request the virtual `fusion` model and the router fans your prompt out to a pane
 
 ## Response headers
 
-Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. If a request fell over between providers, you'll also see `X-Fallback-Attempts: N`.
+Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. If a request fell over between providers, you'll also see `X-Fallback-Attempts: N` and `X-Fallback-Trail`, which names each hop that failed and why:
+
+```
+X-Fallback-Attempts: 2
+X-Fallback-Trail: groq/llama-3.3-70b key1=rate_limited; google/gemini-2.5-flash key2=timeout
+```
+
+`X-Fallback-Detail` adds what each of those hops **cost**, which is the part you cannot reconstruct from the trail — a request answered in 40s reads identically whether one provider stalled for 39 seconds or four failed fast:
+
+```
+X-Fallback-Detail: groq/llama-3.3-70b key1=rate_limited t=0+39000ms msg=Groq API error 429: rate limit; google/gemini-2.5-flash key2=timeout t=39000+12ms
+```
+
+`t=<start>+<duration>ms` is the offset from the start of the failover chain and how long that hop ran. `msg=` is the provider's error, redacted and truncated; it is last in each record, and any semicolon inside it becomes a comma so `; ` stays an unambiguous record separator.
+
+The detail header is **off by default** — it puts hop timings and provider error text on the response. Turn it on with `FALLBACK_DETAIL_HEADER=1` or the `expose_fallback_detail_header` settings key, which takes precedence. Both headers list at most ten hops and then a `; +N more` marker.
+
+Only hops that already **failed** can appear. The hop actually serving your request is recorded after its response finishes — after the JSON is sent, or after the stream closes — so its duration does not exist while the headers are still open. Use `X-Routed-Via` to see which provider that was.
 
 HTTP headers only carry printable ASCII, so a model id with characters outside that range (a Chinese name from a relay catalog, for example) is percent-encoded in the header — run the value through `decodeURIComponent` (or `urllib.parse.unquote`) to read it back.
 
