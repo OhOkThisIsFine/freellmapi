@@ -12,9 +12,10 @@ import { proxyFetch } from '../lib/proxy.js';
 import { providerTimeoutMs, streamStallTimeoutMs } from '../lib/provider-timeout.js';
 import { extractThinkTagsFromStream } from '../lib/think-tags.js';
 
-/** A provider HTTP error carrying the upstream status and, when the response
- *  included a Retry-After header, the parsed delay so the router can bench the
- *  key for at least that long. */
+/** A provider HTTP error carrying the upstream status and, when the provider
+ *  stated one, the parsed back-off so the router can bench the key for at least
+ *  that long. The delay may come from the Retry-After header or from the error
+ *  body — see providerHttpError. */
 export interface ProviderHttpError extends Error {
   status?: number;
   retryAfterMs?: number;
@@ -40,13 +41,109 @@ export function parseRetryAfterMs(value: string | null | undefined): number | un
   return undefined;
 }
 
+/** A protobuf Duration, as google.rpc.RetryInfo spells its `retryDelay`:
+ *  digits, an optional fraction, then a literal `s` ("17s", "1.5s", "0.25s"). */
+const PROTOBUF_DURATION = /^(\d+(?:\.\d+)?)s$/;
+
+/** "Please try again in 7.66s" / "retry after 30 seconds" / "try again in 2m".
+ *  Anchored on an explicit retry phrase so an unrelated number in an error
+ *  message can never be mistaken for a back-off. */
+const PROSE_RETRY = /(?:try again|retry)\s+(?:in|after)\s+(\d+(?:\.\d+)?)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hour|hours)\b/i;
+
+const UNIT_MS: Record<string, number> = {
+  ms: 1,
+  s: 1000, sec: 1000, secs: 1000, second: 1000, seconds: 1000,
+  m: 60_000, min: 60_000, mins: 60_000, minute: 60_000, minutes: 60_000,
+  h: 3_600_000, hour: 3_600_000, hours: 3_600_000,
+};
+
+function clampRetryMs(ms: number): number | undefined {
+  if (!Number.isFinite(ms) || ms < 0) return undefined;
+  return Math.min(ms, MAX_RETRY_AFTER_MS);
+}
+
+/** Depth-first search for the first `retryDelay`/`retry_after`-shaped field. The
+ *  shape varies by provider and by endpoint within a provider, so walking is
+ *  more durable than a list of exact paths — and cheaper to maintain than one
+ *  parser per adapter. Depth-capped so a pathological body cannot spin. */
+function findStatedDelayMs(node: unknown, depth = 0): number | undefined {
+  if (depth > 6 || node === null || typeof node !== 'object') return undefined;
+
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      const found = findStatedDelayMs(item, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    const normalized = key.toLowerCase().replace(/[_-]/g, '');
+    if (normalized === 'retrydelay' || normalized === 'retryafter' || normalized === 'retryafterseconds') {
+      // google.rpc.RetryInfo states "17s"; other providers state bare seconds.
+      if (typeof value === 'string') {
+        const duration = PROTOBUF_DURATION.exec(value.trim());
+        if (duration) return clampRetryMs(Number(duration[1]) * 1000);
+        if (/^\d+(\.\d+)?$/.test(value.trim())) return clampRetryMs(Number(value) * 1000);
+      }
+      if (typeof value === 'number') return clampRetryMs(value * 1000);
+    }
+    const found = findStatedDelayMs(value, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+/**
+ * The back-off a provider stated inside its error BODY, in milliseconds.
+ *
+ * Not every provider uses the Retry-After header. Gemini answers a 429 with
+ * `error.details[]` carrying a `google.rpc.RetryInfo` whose `retryDelay` is
+ * "17s", and several OpenAI-compatible tiers only say it in prose. Those hints
+ * were being thrown away: the body is flattened to a single message string
+ * before it reaches the router, so a provider that told us exactly when to come
+ * back got the same heuristic cooldown ladder as one that said nothing.
+ */
+export function parseStatedRetryMs(body: unknown): number | undefined {
+  if (body == null) return undefined;
+
+  if (typeof body !== 'string') {
+    const structured = findStatedDelayMs(body);
+    if (structured !== undefined) return structured;
+  }
+
+  // Prose last: a stated field is a promise, a sentence is an observation.
+  const text = typeof body === 'string' ? body : safeStringify(body);
+  const prose = text ? PROSE_RETRY.exec(text) : null;
+  if (prose) {
+    const unit = UNIT_MS[prose[2].toLowerCase()];
+    if (unit) return clampRetryMs(Number(prose[1]) * unit);
+  }
+  return undefined;
+}
+
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? '';
+  } catch {
+    return ''; // Circular or otherwise unserialisable — no prose to read.
+  }
+}
+
 /** Build an error for a non-OK upstream response, capturing the status and any
- *  Retry-After hint. Used by every provider adapter so the proxy can honor a
- *  provider's explicit back-off when it sets the cooldown. */
-export function providerHttpError(res: Response, message: string): ProviderHttpError {
+ *  stated back-off. Used by every provider adapter so the proxy can honor a
+ *  provider's explicit hint when it sets the cooldown.
+ *
+ *  `body` is the already-parsed error payload the caller used to build
+ *  `message`. Only a delay is read out of it and only a number is kept — the
+ *  body itself is never retained, so nothing extra reaches a log or the
+ *  attempt trace. The Retry-After header still wins when both are present: it
+ *  is the standard channel, and preferring it keeps existing behavior exactly
+ *  as it was. */
+export function providerHttpError(res: Response, message: string, body?: unknown): ProviderHttpError {
   const err = new Error(message) as ProviderHttpError;
   err.status = res.status;
-  const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after'));
+  const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after')) ?? parseStatedRetryMs(body);
   if (retryAfterMs !== undefined) err.retryAfterMs = retryAfterMs;
   return err;
 }
