@@ -177,6 +177,45 @@ describe('Claude family pools (llm-relay routing.tiers equivalent)', () => {
       expect(body.content[0].text).toBe('auto served it');
     });
 
+    // The catalog stores one row per (provider, model), so naming a model in a
+    // pool has to mean "this model wherever it is served" — otherwise the id an
+    // operator reads out of /v1/models resolves to nothing at all, because that
+    // listing shows group slugs while `models.model_id` holds provider-native
+    // spellings.
+    it('expands one model name to every provider that serves it', async () => {
+      const db = getDb();
+      const { encrypted, iv, authTag } = encrypt('cerebras-key');
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+        VALUES ('cerebras', 'test', ?, ?, ?, 'healthy', 1)
+      `).run(encrypted, iv, authTag);
+      try {
+        // 'gpt-oss-120b' is a bare model_id on cerebras and the group slug for
+        // groq's 'openai/gpt-oss-120b' — one name, two provider rows.
+        setClaudeModelMap({ haiku: ['gpt-oss-120b'] });
+        chatCompletion.mockRejectedValue(new Error('Groq API error 500: upstream boom'));
+
+        await messages(app, { model: 'claude-3-5-haiku-20241022' }, key);
+
+        const dispatched = dispatchedModels();
+        expect(dispatched.length).toBeGreaterThan(1);
+        // Every attempt is some spelling of the SAME model — the pool expanded
+        // across providers rather than leaking into the rest of the catalog.
+        expect(dispatched.every(m => m.includes('gpt-oss-120b'))).toBe(true);
+      } finally {
+        db.prepare("DELETE FROM api_keys WHERE platform = 'cerebras'").run();
+      }
+    });
+
+    it('accepts a provider-qualified entry to pin one copy', async () => {
+      setClaudeModelMap({ haiku: ['groq:openai/gpt-oss-120b'] });
+      chatCompletion.mockRejectedValue(new Error('Groq API error 500: upstream boom'));
+
+      await messages(app, { model: 'claude-3-5-haiku-20241022' }, key);
+
+      expect(dispatchedModels()).toEqual(['openai/gpt-oss-120b']);
+    });
+
     it('skips a disabled member but still honors the rest of the pool', async () => {
       getDb().prepare("UPDATE models SET enabled = 0 WHERE model_id = ?").run(POOL[0]);
       try {
