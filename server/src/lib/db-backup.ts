@@ -5,6 +5,7 @@ import { gzipSync, gunzipSync } from 'zlib';
 import type { Db } from '../db/types.js';
 import type { Scheduler } from './scheduler.js';
 import { getDefaultDbPath } from '../db/index.js';
+import { restrictToOwner } from './file-permissions.js';
 
 const MAGIC = Buffer.from('FAPIBK1\0');
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
@@ -107,7 +108,15 @@ async function writeTarget(target: string, payload: Buffer): Promise<void> {
   }
 
   fs.mkdirSync(path.dirname(path.resolve(target)), { recursive: true });
-  fs.writeFileSync(target, payload);
+  // Encrypted, but not therefore safe to leave world-readable: the key is
+  // FREEAPI_DB_BACKUP_KEY or ENCRYPTION_KEY, which on a normal install sits in a
+  // .env file on the same host. The mode covers creation; restrictToOwner covers
+  // the overwrite case, where an existing file keeps the mode it already had —
+  // and covers Windows, where the mode argument is a no-op.
+  fs.writeFileSync(target, payload, { mode: 0o600 });
+  if (!restrictToOwner(target)) {
+    console.warn(`[db-backup] could not restrict permissions on ${target} — it may be readable by other local accounts`);
+  }
 }
 
 export async function restoreDbBackupIfNeeded(dbPath = getDefaultDbPath()): Promise<DbBackupResult> {
@@ -128,7 +137,13 @@ export async function restoreDbBackupIfNeeded(dbPath = getDefaultDbPath()): Prom
   }
 
   fs.mkdirSync(path.dirname(path.resolve(dbPath)), { recursive: true });
-  fs.writeFileSync(dbPath, restored);
+  // This is the decrypted database — provider keys and the dashboard password
+  // hash in the clear. connectDb hardens it too, but that is a later call and
+  // sometimes a later process; the file must not be readable in between.
+  fs.writeFileSync(dbPath, restored, { mode: 0o600 });
+  if (!restrictToOwner(dbPath)) {
+    console.warn(`[db-backup] could not restrict permissions on the restored database at ${dbPath}`);
+  }
   console.log(`[db-backup] restored ${restored.length} bytes from ${target}`);
   return { ok: true, target, bytes: restored.length, restored: true };
 }
