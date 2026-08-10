@@ -1000,6 +1000,15 @@ async function streamCompletion(
       heldText = '';
     }
 
+    // Opt-in schema verdict, before message_start. Tool calls are buffered to
+    // the end of the stream here, so a tool-only turn has committed nothing and
+    // can still fail over. A turn that already emitted text is past its commit
+    // point — leave it alone rather than tearing down a stream mid-flight.
+    if (isToolArgumentValidationEnabled() && !messageStarted && completedCalls.length > 0) {
+      const invalid = invalidToolCallReasons(completedCalls, schemas);
+      if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+    }
+
     // Nothing usable came out — fail over (message_start was never sent, so the
     // client never saw this attempt).
     if (!messageStarted && completedCalls.length === 0) {

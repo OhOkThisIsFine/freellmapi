@@ -10,6 +10,7 @@ import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js'
 import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
 import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 import { isAbortLikeError } from '../lib/error-classify.js';
@@ -83,11 +84,21 @@ export class OpenAICompatProvider extends BaseProvider {
     const rescue = rescueInlineToolCalls(failed, toolNames);
     if (!rescue.detected || !rescue.calls?.length) return null;
     const schemas = toolSchemaMap(options?.tools);
-    return rescue.calls.map((c, i) => ({
+    const rescued = rescue.calls.map((c, i) => ({
       id: `call_rescued_${i + 1}`,
       type: 'function' as const,
       function: { name: c.name, arguments: repairToolArguments(c.arguments, schemas.get(c.name)) },
     }));
+    // Opt-in schema verdict. A rescue that produces schema-invalid arguments
+    // has turned the provider's 400 into a "success" the client cannot use, so
+    // decline it instead: the original upstream error propagates and the loop
+    // fails over exactly as it did before the rescue existed. Declining is the
+    // right shape here rather than throwing our own error — we are inside the
+    // provider's error path already.
+    if (isToolArgumentValidationEnabled() && invalidToolCallReasons(rescued, schemas).length > 0) {
+      return null;
+    }
+    return rescued;
   }
 
   /** Extract the useful text from an upstream error body. Most providers put it

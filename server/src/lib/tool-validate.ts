@@ -157,18 +157,30 @@ export function invalidToolArgumentsError(displayName: string, reasons: string[]
 }
 
 /**
+ * A tool call in either shape this codebase carries it in: the OpenAI wire
+ * shape (`function.name` / `function.arguments`) that most surfaces use, and
+ * the flat accumulator shape the Anthropic stream assembles before converting
+ * to `tool_use` blocks.
+ */
+export type ToolCallish = {
+  function?: { name?: string; arguments?: string };
+  name?: string;
+  arguments?: string;
+};
+
+/**
  * Verdicts for a whole turn's tool calls. Returns the reasons for those that
  * violate their schema; an empty array means the turn is servable.
  */
 export function invalidToolCallReasons(
-  calls: Array<{ function?: { name?: string; arguments?: string } }> | undefined,
+  calls: ToolCallish[] | undefined,
   schemas: Map<string, unknown>,
 ): string[] {
   if (!calls || calls.length === 0) return [];
   const reasons: string[] = [];
   for (const call of calls) {
-    const name = call.function?.name;
-    const args = call.function?.arguments;
+    const name = call.function?.name ?? call.name;
+    const args = call.function?.arguments ?? call.arguments;
     if (!name || typeof args !== 'string') continue;
     const schema = schemas.get(name);
     if (schema === undefined) continue; // Tool the caller never declared a schema for.
