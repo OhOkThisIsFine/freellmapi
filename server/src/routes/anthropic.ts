@@ -15,6 +15,7 @@ import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+import { convertDocumentBlock, documentRejectionMessage } from '../lib/anthropic-documents.js';
 import { isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
@@ -293,10 +294,14 @@ interface ConvertedRequest {
   tool_choice?: ChatToolChoice;
   hasImage: boolean;
   wantsTools: boolean;
+  /** Reasons the request carried documents we cannot convert. Non-empty means
+   *  the caller must be told, not served — see the rejection below. */
+  documentRejections: string[];
 }
 
 function convertRequest(input: AnthropicRequest): ConvertedRequest {
   const messages: ChatMessage[] = [];
+  const documentRejections: string[] = [];
   let hasImage = false;
 
   const system = flattenSystem(input.system);
@@ -347,8 +352,15 @@ function convertRequest(input: AnthropicRequest): ConvertedRequest {
           tool_call_id: String((block as any).tool_use_id ?? ''),
           content: flattenToolResult((block as any).content),
         });
+      } else if (type === 'document') {
+        // A document that is already text costs nothing to inline. One that
+        // needs decoding cannot be served by any provider here, and dropping
+        // it would answer confidently about a document the model never saw.
+        const result = convertDocumentBlock(block);
+        if (result.ok) textParts.push(result.text);
+        else documentRejections.push(result.reason);
       }
-      // Unknown block types (thinking, document, …) are intentionally dropped.
+      // Other unknown block types (thinking, …) are intentionally dropped.
     }
 
     const text = textParts.join('\n');
@@ -386,6 +398,7 @@ function convertRequest(input: AnthropicRequest): ConvertedRequest {
     tool_choice: convertToolChoice(input.tool_choice),
     hasImage,
     wantsTools: (tools?.length ?? 0) > 0,
+    documentRejections,
   };
 }
 
@@ -575,6 +588,15 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const { temperature, top_p, stream } = body;
 
   const converted = convertRequest(body);
+  // Rejected before routing, and before compression: this is our verdict, not
+  // a provider's. Entering the failover loop would spend quota on a request
+  // every candidate would fail identically, and book it as provider failure.
+  if (converted.documentRejections.length > 0) {
+    const message = documentRejectionMessage(converted.documentRejections);
+    console.warn(`[anthropic] 400 unsupported document block: ${converted.documentRejections.join('; ')}`);
+    sendError(res, 400, 'invalid_request_error', message);
+    return;
+  }
   let { messages } = converted;
   const { tools, tool_choice, hasImage, wantsTools } = converted;
   const systemHasCacheControl = Array.isArray(body.system)
@@ -1053,7 +1075,15 @@ anthropicRouter.post('/messages/count_tokens', (req: Request, res: Response) => 
     sendError(res, 400, 'invalid_request_error', 'Invalid request');
     return;
   }
-  const { messages, tools } = convertRequest(parsed.data);
+  const converted = convertRequest(parsed.data);
+  // Same verdict as POST /messages, so a client sizing a context window learns
+  // the document is unusable here rather than getting a count for a prompt we
+  // would go on to refuse.
+  if (converted.documentRejections.length > 0) {
+    sendError(res, 400, 'invalid_request_error', documentRejectionMessage(converted.documentRejections));
+    return;
+  }
+  const { messages, tools } = converted;
   const compressionResult = compressRequest(messages, {
     header: req.headers['x-freellm-compress'],
     tools,

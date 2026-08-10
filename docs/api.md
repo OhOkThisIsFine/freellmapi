@@ -15,6 +15,7 @@ Any OpenAI-compatible client works (Anthropic / Claude clients too — see [Anth
 - [Ollama emulation](#ollama-emulation)
 - [Revocable URL tokens](#revocable-url-tokens)
 - [Vision / image input](#vision--image-input)
+- [Document attachments](#document-attachments)
 - [Images & text-to-speech](#images--text-to-speech)
 - [Fusion (multi-model synthesis)](#fusion-multi-model-synthesis)
 - [Response headers](#response-headers)
@@ -222,6 +223,21 @@ print(resp.choices[0].message.content)
 ```
 
 If no vision-capable model is enabled in your Fallback Chain, an image request returns a clear `422` (`code: "no_vision_model"`) rather than silently dropping the image. (Image input on `/v1/responses` isn't supported yet — use `/v1/chat/completions`.)
+
+## Document attachments
+
+Anthropic's `document` content blocks are accepted on `/v1/messages` when their source is already text:
+
+```json
+{"type": "document", "title": "contract.txt",
+ "source": {"type": "text", "media_type": "text/plain", "data": "PAYMENT TERMS: net 30."}}
+```
+
+`text` and `content` sources are inlined into the prompt, wrapped in a fence tagged with a hash of the document body so the model can tell quoted material from your instructions. The tag is derived from the content rather than randomized, so a repeated attachment keeps the prompt prefix stable and stays cacheable.
+
+**Binary sources — `base64` (PDF, DOCX, XLSX…) and `url` — return a `400`.** No provider in the pool accepts them, and there is no local converter, so the honest answer is to refuse: forwarding the request would drop the attachment and produce a confident answer about a document the model never saw. The rejection happens before routing, so it spends no provider quota. Send the extracted text instead.
+
+`url` sources are refused rather than fetched on your behalf; making the proxy retrieve arbitrary URLs would turn it into a request forwarder for whatever a client names.
 
 ## Images & text-to-speech
 
