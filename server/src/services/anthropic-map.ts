@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { getDb, getSetting, setSetting } from '../db/index.js';
+import { getModelGroups, resolveRequestedIdForDispatch } from './model-groups.js';
 
 // Claude Code model mapping. Claude Code keeps its built-in model names
 // (e.g. `claude-sonnet-4-5` as the main model, `claude-3-5-haiku` as the
@@ -130,6 +131,10 @@ export function resolveAnthropicModel(model?: string): ResolvedAnthropicModel {
     const row = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(modelId) as { id: number } | undefined;
     return row?.id;
   };
+  const lookupEnabledDbId = (dbId: number): number | undefined => {
+    const row = db.prepare('SELECT id FROM models WHERE id = ? AND enabled = 1').get(dbId) as { id: number } | undefined;
+    return row?.id;
+  };
 
   const family = classifyClaudeFamily(model);
   if (family) {
@@ -137,15 +142,37 @@ export function resolveAnthropicModel(model?: string): ResolvedAnthropicModel {
     if (!target || target === 'auto') return { pinned: false };
 
     if (Array.isArray(target)) {
-      // A pool. Resolve members in declared order, dropping any that are
-      // disabled or gone. An empty result degrades to auto for the same reason
-      // a dead single pin does: refusing to serve because the operator's map
-      // went stale is worse than routing normally.
+      // A pool. Each entry is resolved the way the OpenAI surfaces resolve a
+      // requested model, NOT by a raw `models.model_id` lookup — the catalog
+      // stores one row per (provider, model), so "deepseek-v4-flash" is three
+      // rows with three different provider-native spellings
+      // (`deepseek-ai/DeepSeek-V4-Flash`, `deepseek-ai/deepseek-v4-flash`,
+      // `deepseek-v4-flash-free`). A raw lookup would miss the id the operator
+      // actually sees in /v1/models, and even on a hit would pin ONE provider's
+      // copy — the opposite of what naming a model in a pool means.
+      //
+      // resolveRequestedIdForDispatch accepts all three spellings a pool entry
+      // might use — `platform:model_id`, a bare model_id (every provider that
+      // serves it), and the group's canonical slug — so one model name expands
+      // to every provider carrying it, in group order.
+      const groups = getModelGroups();
       const ids: number[] = [];
-      for (const memberId of target) {
-        const id = lookupEnabled(memberId);
+      const add = (id: number | undefined): void => {
         if (id != null && !ids.includes(id)) ids.push(id);
+      };
+      for (const entry of target) {
+        const resolved = resolveRequestedIdForDispatch(entry, groups);
+        if (resolved && resolved.memberDbIds.length > 0) {
+          // Groups span enabled AND disabled rows so resolution stays complete;
+          // only enabled ones can serve.
+          for (const dbId of resolved.memberDbIds) add(lookupEnabledDbId(dbId));
+          continue;
+        }
+        add(lookupEnabled(entry));
       }
+      // An empty result degrades to auto for the same reason a dead single pin
+      // does: refusing to serve because the operator's map went stale is worse
+      // than routing normally.
       if (ids.length === 0) return { pinned: false };
       return { poolDbIds: ids, preferredModelDbId: ids[0], pinned: true };
     }
