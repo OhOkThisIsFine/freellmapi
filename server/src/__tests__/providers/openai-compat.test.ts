@@ -624,6 +624,44 @@ describe('OpenAICompatProvider - platform instances', () => {
       expect(chunks.some(c => c.choices[0].finish_reason === 'tool_calls')).toBe(true);
     });
 
+    // The rescue turns a provider 400 into a success. If what it recovered does
+    // not satisfy the tool's schema, that success is one the client cannot use —
+    // so with the opt-in verdict on, decline the rescue and let the original
+    // error propagate, exactly as it did before #264.
+    it('declines the rescue when the recovered arguments violate the schema', async () => {
+      process.env.VALIDATE_TOOL_ARGUMENTS = '1';
+      try {
+        vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+          ok: false, status: 400, statusText: 'Bad Request',
+          json: () => Promise.resolve({
+            ...failBody,
+            error: { ...failBody.error, failed_generation: '<function=read={"nope": "sample.txt"}</function>' },
+          }),
+        } as any);
+
+        await expect(
+          provider.chatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' }),
+        ).rejects.toThrow(/API error 400/);
+      } finally {
+        delete process.env.VALIDATE_TOOL_ARGUMENTS;
+      }
+    });
+
+    it('still rescues schema-valid arguments while the verdict is on', async () => {
+      process.env.VALIDATE_TOOL_ARGUMENTS = '1';
+      try {
+        vi.spyOn(global, 'fetch').mockResolvedValueOnce({
+          ok: false, status: 400, statusText: 'Bad Request',
+          json: () => Promise.resolve(failBody),
+        } as any);
+
+        const r = await provider.chatCompletion('key', [{ role: 'user', content: 'read sample.txt' }], 'llama-3.3-70b-versatile', { tools, tool_choice: 'auto' });
+        expect(JSON.parse(r.choices[0].message.tool_calls![0].function.arguments)).toEqual({ file_path: 'sample.txt' });
+      } finally {
+        delete process.env.VALIDATE_TOOL_ARGUMENTS;
+      }
+    });
+
     it('still throws when there is no failed_generation to rescue', async () => {
       vi.spyOn(global, 'fetch').mockResolvedValueOnce({
         ok: false, status: 400, statusText: 'Bad Request',

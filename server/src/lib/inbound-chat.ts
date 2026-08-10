@@ -32,6 +32,7 @@ import { routedViaValue } from './header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from './guardrails.js';
 import { contentToString } from './content.js';
 import { repairToolArguments, toolSchemaMap } from './tool-args.js';
+import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from './tool-validate.js';
 import {
   containsDialectMarker,
   couldBecomeDialectMarker,
@@ -282,6 +283,12 @@ export async function runInboundChat(
             schemas.get(call.function.name),
           );
         }
+        // Opt-in schema verdict on what the repair could not fix. Nothing has
+        // been written yet on this path, so the failover hop is invisible.
+        if (isToolArgumentValidationEnabled() && toolCalls.length > 0) {
+          const invalid = invalidToolCallReasons(toolCalls, schemas);
+          if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+        }
         const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
         const completionTokens = result.usage?.completion_tokens
           ?? Math.ceil((text.length + reasoning.length + toolCalls.reduce(
@@ -428,6 +435,15 @@ export async function runInboundChat(
             },
             ...(call.thoughtSignature ? { thought_signature: call.thoughtSignature } : {}),
           }));
+        // Opt-in schema verdict, before the tool calls are committed. Tool
+        // calls are buffered to the end of the stream on this path, so a
+        // tool-only turn has sent nothing yet and can still fail over. A turn
+        // that already streamed text is past its commit point — leave it
+        // alone rather than tearing down a stream the client is reading.
+        if (isToolArgumentValidationEnabled() && toolCalls.length > 0 && !committed) {
+          const invalid = invalidToolCallReasons(toolCalls, schemas);
+          if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+        }
         if (toolCalls.length) {
           commit();
           wire.sendToolCalls?.(res, route, toolCalls);

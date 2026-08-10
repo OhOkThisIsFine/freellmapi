@@ -15,6 +15,7 @@ import { resolveAuth, prependSystemPrompt } from '../lib/system-prompt.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
   extractApiToken,
@@ -761,6 +762,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           // Codex hard-rejects the call ("invalid type: string, expected a
           // sequence"). Clients consume the *.done events / final response for
           // arguments, so repairing here covers the streamed path too.
+          //
+          // No schema verdict here, deliberately. This surface commits on the
+          // FIRST tool-call delta (`commit()` above, where the function_call
+          // item is opened) — the arguments are not complete until this point,
+          // which is long after the skeleton and the item.added events have
+          // left. A verdict here could only turn a delivered-but-invalid call
+          // into a `response.failed` on a stream the client is already reading,
+          // which is strictly worse. Wiring it would mean holding the
+          // function_call item until its arguments finish, the way
+          // /chat/completions buffers — a change to this route's commit point,
+          // not to validation.
           const finalToolCalls: ChatToolCall[] = [];
           for (const acc of toolAcc.values()) {
             const repairedArgs = repairToolArguments(acc.args, toolSchemas.get(acc.name));
@@ -851,6 +863,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           text = rescue.cleanText;
         }
       }
+
+      // Opt-in schema verdict on what the repair could not fix. Thrown before
+      // anything is written, so the failover hop is invisible to the client.
+      if (isToolArgumentValidationEnabled() && toolCalls.length > 0) {
+        const invalid = invalidToolCallReasons(toolCalls, toolSchemas);
+        if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+      }
+
       const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
       // #764: include reasoning tokens (message.reasoning_content / reasoning)
       // in the chars/4 estimate so thinking models aren't undercounted when the
