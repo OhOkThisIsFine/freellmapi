@@ -13,6 +13,7 @@ import { routeRequest, resolveStickyPreference, routingReserveTokens, type Route
 import { getSetting, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { convertDocumentBlock, documentRejectionMessage } from '../lib/anthropic-documents.js';
@@ -744,6 +745,14 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
           if (tc?.function?.arguments != null) {
             tc.function.arguments = repairToolArguments(tc.function.arguments, schemas.get(tc.function.name));
           }
+        }
+        // Opt-in schema verdict on what the repair could not fix. This surface
+        // is where the silent failure was worst: parseToolInput turns
+        // unparseable arguments into `input: {}`, so the client sees a tool_use
+        // block with nothing in it and no indication anything went wrong.
+        if (isToolArgumentValidationEnabled()) {
+          const invalid = invalidToolCallReasons(respToolCalls, schemas);
+          if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
         }
       }
 

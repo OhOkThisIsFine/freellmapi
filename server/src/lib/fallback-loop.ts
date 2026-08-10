@@ -322,6 +322,7 @@ export type AttemptErrorClass =
   | 'provider_bad_request'
   | 'empty_completion'
   | 'format_ignored'
+  | 'invalid_tool_arguments'
   | 'timeout'
   | 'rate_limited'
   | 'upstream_error'
@@ -351,6 +352,9 @@ export function classifyAttemptError(err: any): AttemptErrorClass {
   const msg = (err?.message ?? '').toLowerCase();
   if (msg.includes('empty completion')) return 'empty_completion';
   if (msg.includes('ignored response_format') || msg.includes('truncated json')) return 'format_ignored';
+  // Before the generic classes so the trail names the real cause rather than
+  // booking a schema violation as a bare 'error'.
+  if (msg.includes('invalid tool arguments')) return 'invalid_tool_arguments';
   if (isTimeoutErrorText(msg)) return 'timeout';
   if (msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests') || msg.includes('quota')) return 'rate_limited';
   const status = typeof err?.status === 'number' ? err.status : 0;

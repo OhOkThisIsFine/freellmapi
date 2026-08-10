@@ -96,7 +96,13 @@ export function isRetryableError(err: any): boolean {
     // First-byte timeout (#584): the grace budget expired before ANY byte
     // reached the client, so the next candidate can serve it invisibly.
     || msg.includes('no first byte')
-    || msg.includes('unparseable inline tool-call dialect');
+    || msg.includes('unparseable inline tool-call dialect')
+    // The model emitted a tool call whose arguments violate the schema the
+    // caller declared (opt-in check, lib/tool-validate.ts). Thrown before any
+    // byte reached the client, and a different model usually gets the same
+    // call right — the thrower marks the model skipped for this request, since
+    // a sibling key would misbehave identically.
+    || msg.includes('invalid tool arguments');
 }
 
 // A genuine provider QUOTA signal: a structured 429 or rate-limit/quota wording.
