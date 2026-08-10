@@ -1291,6 +1291,16 @@ export function resolveModelGroupCandidates(
    * which is what every other caller wants.
    */
   demotedDbIds?: ReadonlySet<number>,
+  /**
+   * Take the fallback order from the POSITION of each id in `memberDbIds`
+   * rather than from the model's stored profile/fallback priority. Model groups
+   * want the stored priority (their members are the same model across
+   * providers, so the operator's global ranking is the right tiebreak); a
+   * Claude-family POOL wants the order the operator literally wrote, which is
+   * the whole point of writing a list. Only affects the `priority` strategy —
+   * a bandit strategy scores members on observed reliability/speed either way.
+   */
+  listOrderPriority?: boolean,
 ): ChainRow[] {
   const db = getDb();
   const strategy = getRoutingStrategy();
@@ -1323,10 +1333,11 @@ export function resolveModelGroupCandidates(
     `);
 
   const rows: ChainRow[] = [];
-  for (const id of memberDbIds) {
+  for (const [index, id] of memberDbIds.entries()) {
     const row = (activeProfileId == null ? selectMember.get(id) : selectMember.get(activeProfileId, id)) as ChainRow | undefined;
     if (!row) continue;
     row.match_tier = demotedDbIds?.has(id) ? 1 : 0;
+    if (listOrderPriority) row.priority = index;
     rows.push(row);
   }
   return orderChain(rows, strategy);
