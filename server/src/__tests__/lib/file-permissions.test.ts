@@ -4,6 +4,7 @@ import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   restrictToOwner,
+  restrictDirToOwner,
   restrictAllToOwner,
   windowsRestrictArgs,
   type ExecFileSyncLike,
@@ -18,11 +19,18 @@ const SID = 'S-1-5-21-111-222-333-1002';
 const WHOAMI_OUT = `"E-DESK\\ethan","${SID}"\r\n`;
 
 const created: string[] = [];
+const createdDirs: string[] = [];
 
 function tempFile(contents = 'x'): string {
   const p = path.join(os.tmpdir(), `freeapi-fileperms-${Date.now()}-${Math.random()}`);
   fs.writeFileSync(p, contents);
   created.push(p);
+  return p;
+}
+
+function tempDir(): string {
+  const p = fs.mkdtempSync(path.join(os.tmpdir(), 'freeapi-fileperms-dir-'));
+  createdDirs.push(p);
   return p;
 }
 
@@ -45,6 +53,11 @@ beforeEach(() => {
 afterEach(() => {
   for (const p of created.splice(0)) {
     try { fs.unlinkSync(p); } catch { /* best effort */ }
+  }
+  for (const p of createdDirs.splice(0)) {
+    // A test that hardened the directory may have left it unreadable to the
+    // umask the runner expects; force is enough, these are all mkdtemp paths.
+    try { fs.rmSync(p, { recursive: true, force: true }); } catch { /* best effort */ }
   }
 });
 
@@ -72,6 +85,71 @@ describe('windowsRestrictArgs', () => {
     expect(windowsRestrictArgs('f', SID)).toContain('/grant:r');
     expect(windowsRestrictArgs('f', SID)).not.toContain('/grant');
   });
+
+  it('marks every principal inheritable for a directory, so later children get it', () => {
+    // (OI) object-inherit + (CI) container-inherit are the entire mechanism by
+    // which a WAL sidecar created minutes after startup is born restricted.
+    expect(windowsRestrictArgs('C:\\data', SID, { inheritable: true })).toEqual([
+      'C:\\data',
+      '/inheritance:r',
+      '/grant:r', `*${SID}:(OI)(CI)(F)`,
+      '/grant:r', '*S-1-5-18:(OI)(CI)(F)',
+      '/grant:r', '*S-1-5-32-544:(OI)(CI)(F)',
+    ]);
+  });
+
+  it('leaves inheritance flags off a file, where they would grant nothing', () => {
+    for (const args of [windowsRestrictArgs('f', SID), windowsRestrictArgs('f', SID, {})]) {
+      expect(args.join(' ')).not.toContain('(OI)');
+      expect(args.join(' ')).not.toContain('(CI)');
+    }
+  });
+});
+
+describe('restrictDirToOwner', () => {
+  it('hands icacls the inheritable form on Windows', () => {
+    const dir = tempDir();
+    const exec = fakeExec();
+
+    expect(restrictDirToOwner(dir, { platform: 'win32', execFileSync: exec, ownerSid: SID })).toBe(true);
+
+    expect(exec.calls).toHaveLength(1);
+    expect(exec.calls[0].args).toEqual(windowsRestrictArgs(dir, SID, { inheritable: true }));
+  });
+
+  it('uses 0700 on POSIX, not 0600', () => {
+    // 0600 on a directory is not a stricter 0700 — it clears the search bit and
+    // locks the server out of its own data directory. Assert the mode itself
+    // rather than "owner-only", which both values satisfy.
+    const dir = tempDir();
+    const chmod = vi.spyOn(fs, 'chmodSync').mockImplementation(() => {});
+
+    expect(restrictDirToOwner(dir, { platform: 'linux' })).toBe(true);
+    expect(chmod).toHaveBeenCalledWith(dir, 0o700);
+  });
+
+  it('still uses 0600 for a plain file', () => {
+    const target = tempFile();
+    const chmod = vi.spyOn(fs, 'chmodSync').mockImplementation(() => {});
+
+    expect(restrictToOwner(target, { platform: 'linux' })).toBe(true);
+    expect(chmod).toHaveBeenCalledWith(target, 0o600);
+  });
+
+  it('treats an absent directory as nothing to do', () => {
+    const missing = path.join(os.tmpdir(), `freeapi-fileperms-nodir-${Date.now()}`);
+    const exec = fakeExec();
+
+    expect(restrictDirToOwner(missing, { platform: 'win32', execFileSync: exec })).toBe(true);
+    expect(exec.calls).toHaveLength(0);
+  });
+
+  it('reports failure instead of throwing when icacls fails', () => {
+    const dir = tempDir();
+    const exec = fakeExec({ onIcacls: () => { throw new Error('Access is denied.'); } });
+
+    expect(restrictDirToOwner(dir, { platform: 'win32', execFileSync: exec })).toBe(false);
+  });
 });
 
 describe('restrictToOwner on Windows', () => {
@@ -96,7 +174,12 @@ describe('restrictToOwner on Windows', () => {
     restrictToOwner(target, { platform: 'win32', execFileSync: exec });
 
     for (const call of exec.calls) {
-      expect(path.isAbsolute(call.file)).toBe(true);
+      // path.win32, not path.isAbsolute: the value under test is a Windows path,
+      // and the POSIX implementation this file runs under on CI reads
+      // "C:\\Windows/System32/whoami.exe" as relative because it has no leading
+      // slash. Judging a Windows path by POSIX rules fails the test on the one
+      // platform that always runs it.
+      expect(path.win32.isAbsolute(call.file)).toBe(true);
       expect(call.file.replace(/\\/g, '/').toLowerCase()).toContain('/system32/');
     }
   });

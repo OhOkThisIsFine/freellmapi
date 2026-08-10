@@ -5,7 +5,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'url';
 import { runMigrationsSync } from './migrate/runner.js';
 import { initEncryptionKey, isEncryptionKeyInitialized } from '../lib/crypto.js';
-import { restrictAllToOwner } from '../lib/file-permissions.js';
+import { restrictAllToOwner, restrictDirToOwner } from '../lib/file-permissions.js';
 import { nodeSqliteFactory } from './node-sqlite.js';
 import type { Db, DbFactory } from './types.js';
 
@@ -61,11 +61,21 @@ export function connectDb(
   const ensureDir = opts?.ensureDir ?? true;
   const factory = opts?.factory ?? defaultDbFactory();
 
+  // Gated on ensureDir along with the mkdir: that flag means "this process does
+  // not shape the filesystem here", and changing a directory's permissions is
+  // exactly that kind of change. It also keeps the warning below from firing on
+  // every boot in the read-only environments the flag exists for.
   if (!isMemory && ensureDir) {
     const dataDir = path.dirname(resolvedPath);
+    let created = false;
     if (!fs.existsSync(dataDir)) {
       fs.mkdirSync(dataDir, { recursive: true });
+      created = true;
     }
+    // Before the connection, not after: on Windows the restriction is inherited,
+    // so hardening first means the database file is born protected instead of
+    // spending its first moments with whatever ACL the parent handed down.
+    restrictDataDir(dataDir, created);
   }
 
   db = factory(resolvedPath);
@@ -82,6 +92,85 @@ export function connectDb(
   return db;
 }
 
+/**
+ * Whether the directory holding the database may be restricted to this account.
+ *
+ * The sidecars can only be covered by the directory: SQLite creates `-wal` and
+ * `-shm` on the first write and deletes them on the last clean close, so at
+ * startup there is nothing there to chmod. But the directory is also shared
+ * state — FREEAPI_DB_PATH may point anywhere — and locking down a directory
+ * that is not ours is a worse outage than the leak it prevents. Pointing the DB
+ * at `/tmp/freeapi.db` must not chmod 0700 `/tmp`.
+ *
+ * So the rule is ownership by construction rather than a guess about what is
+ * safe. Two cases qualify, and nothing else does:
+ *
+ *   1. We just created the directory. Nothing else can be living in a directory
+ *      that did not exist a moment ago.
+ *   2. It is the built-in default data directory, which ships as ours.
+ *
+ * Case 2 is what covers the installed base: an existing deployment already has
+ * `server/data`, so case 1 alone would harden new installs and quietly leave
+ * every upgrade behind.
+ *
+ * An operator who points FREEAPI_DB_PATH at a dedicated directory can opt in
+ * with FREEAPI_DB_DIR_HARDENING=1, and one who dislikes the default can opt out
+ * with =0. It is a deliberate default-on-where-safe rather than a flag, because
+ * hardening that only runs when someone remembers to ask for it is the same
+ * class of failure as hardening nobody noticed had stopped running.
+ */
+export function shouldHardenDataDir(
+  dataDir: string,
+  created: boolean,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const override = parseDirHardeningOverride();
+  if (override !== undefined) return override;
+  if (created) return true;
+
+  // Windows paths are case-insensitive; comparing them case-sensitively would
+  // miss `C:\App\Data` vs `c:\app\data` and silently skip the default install.
+  const normalize = (p: string): string =>
+    platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p);
+  return normalize(dataDir) === normalize(path.dirname(DB_PATH));
+}
+
+/** Tri-state, matching CSP_UPGRADE_INSECURE_REQUESTS in lib/config.ts: on, off,
+ *  or unset to leave the policy above in charge. */
+function parseDirHardeningOverride(): boolean | undefined {
+  const raw = process.env.FREEAPI_DB_DIR_HARDENING;
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const lower = raw.trim().toLowerCase();
+  if (lower === 'true' || lower === '1' || lower === 'yes') return true;
+  if (lower === 'false' || lower === '0' || lower === 'no') return false;
+  return undefined;
+}
+
+/** Emitted at most once: connectDb runs once in a server, but a test suite
+ *  reconnects constantly and does not need the same line each time. */
+let warnedUnhardenedDataDir = false;
+
+function restrictDataDir(dataDir: string, created: boolean): void {
+  if (!shouldHardenDataDir(dataDir, created)) {
+    if (!warnedUnhardenedDataDir) {
+      warnedUnhardenedDataDir = true;
+      console.log(
+        `[db] leaving permissions on ${dataDir} as they are: it is not a directory this server created. ` +
+        'The WAL sidecars written there inherit whatever it already grants. ' +
+        'Set FREEAPI_DB_DIR_HARDENING=1 if it belongs to this account alone.',
+      );
+    }
+    return;
+  }
+
+  if (!restrictDirToOwner(dataDir)) {
+    console.warn(
+      `[db] could not restrict permissions on ${dataDir}; ` +
+      'the database and its WAL sidecars may be readable by other local accounts',
+    );
+  }
+}
+
 /** Restrict the DB and its WAL sidecars to the owner. The file holds encrypted
  *  provider keys plus the dashboard password hash, so it must not be readable by
  *  other local users. Best-effort: a filesystem that cannot express the
@@ -89,12 +178,12 @@ export function connectDb(
  *  silently, because a hardening step nobody can see failing is one nobody
  *  notices is absent.
  *
- *  Known gap, pre-existing and platform-independent: on a clean start the
- *  `-wal`/`-shm` sidecars do not exist yet (SQLite creates them on the first
- *  write and removes them on the last close), so this pass only ever restricts
- *  the main file. Covering them needs the containing directory to carry the
- *  restriction so new children inherit it, which cannot be done blindly here —
- *  FREEAPI_DB_PATH may point anywhere, including a shared temp directory. */
+ *  This pass only ever finds the main file on a clean start; the sidecars do not
+ *  exist yet. They are covered by the directory instead — see
+ *  shouldHardenDataDir. It still runs for both, because a directory this server
+ *  is not allowed to touch can still hold sidecars left behind by an unclean
+ *  shutdown, and because the main file predates the directory pass on any
+ *  install that upgraded into it. */
 function restrictDbFilePermissions(resolvedPath: string): void {
   const failed = restrictAllToOwner(['', '-wal', '-shm'].map(suffix => `${resolvedPath}${suffix}`));
   if (failed.length > 0) {
